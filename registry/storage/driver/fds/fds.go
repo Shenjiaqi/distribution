@@ -1,32 +1,27 @@
 package fds
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+	"bytes"
 
-	"github.com/Shenjiaqi/galaxy-fds-sdk-golang"
+	"github.com/XiaoMi/galaxy-fds-sdk-golang"
 
 	"github.com/docker/distribution/context"
-	"github.com/docker/distribution/registry/client/transport"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/base"
 	"github.com/docker/distribution/registry/storage/driver/factory"
-	"github.com/bitly/go-simplejson"
-	"errors"
-	"github.com/docker/distribution/vendor/github.com/aws/aws-sdk-go/service/s3"
-	"github.com/Shenjiaqi/galaxy-fds-sdk-golang/Model"
+	"github.com/XiaoMi/galaxy-fds-sdk-golang/Model"
 )
 
 const driverName = "fds"
 
-const minChunkSize = 5 << 20
+const minChunkSize = (10 << 20)
 
 const defaultChunkSize = 2 * minChunkSize
 
@@ -38,18 +33,20 @@ var validRegions = map[string]struct{}{}
 
 //DriverParameters A struct that encapsulates all of the driver parameters after all values have been set
 type DriverParameters struct {
-	AccessKey      string
-	SecretKey      string
-	Bucket         string
-	Region         string
-	EnableHttps    bool
-	ChunkSize      int64
-	RootDirectory  string
+	AccessKey     string
+	SecretKey     string
+	Bucket        string
+	Region        string
+	EnableHttps   bool
+	EnableCDN     bool
+	ChunkSize     int64
+	RootDirectory string
 }
 
 func init() {
 	for _, region := range []string{
 		"",
+		"staging",
 		"awsbj0",
 		"awsusor0",
 		"awssgp0",
@@ -100,7 +97,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 
 	regionName, ok := parameters["region"]
 	if regionName == nil {
-		return nil, fmt.Errorf("No region parameter provided")
+		regionName = ""
 	}
 	region := fmt.Sprint(regionName)
 	_, ok = validRegions[region]
@@ -113,9 +110,20 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		return nil, fmt.Errorf("No bucket parameter provided")
 	}
 
- 	enableHttps, ok := parameters["enableHttps"]
-	if !ok || enableHttps == nil {
-		enableHttps = true
+	enableHttps := true
+	enableHttpsStr, ok := parameters["enablehttps"]
+	if ok {
+		if strings.EqualFold("false", fmt.Sprint(enableHttpsStr)) {
+			enableHttps = false
+		}
+	}
+
+	enableCDN := true
+	enableCDNStr, ok := parameters["enablecdn"]
+	if ok {
+		if strings.EqualFold("false", fmt.Sprint(enableCDNStr)) {
+			enableCDN = false
+		}
 	}
 
 	chunkSize := int64(defaultChunkSize)
@@ -141,23 +149,20 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		return nil, fmt.Errorf("The chunksize %#v parameter should be a number that is larger than or equal to %d", chunkSize, minChunkSize)
 	}
 
-	rootDirectory := parameters["rootdirectory"]
-	if rootDirectory == nil {
+	rootDirectory, ok := parameters["rootdirectory"].(string)
+	if !ok {
 		rootDirectory = ""
-	} else if (len(rootDirectory) > 0) {
-		if !strings.HasSuffix(rootDirectory, "/") {
-			rootDirectory += "/"
-		}
 	}
 
 	params := DriverParameters{
-		fmt.Sprint(accessKey),
-		fmt.Sprint(secretKey),
-		fmt.Sprint(bucket),
-		region,
-		enableHttps,
-		chunkSize,
-		fmt.Sprint(rootDirectory),
+		AccessKey:     fmt.Sprint(accessKey),
+		SecretKey:     fmt.Sprint(secretKey),
+		Bucket:        fmt.Sprint(bucket),
+		Region:        region,
+		EnableHttps:   enableHttps,
+		EnableCDN:     enableCDN,
+		ChunkSize:     chunkSize,
+		RootDirectory: fmt.Sprint(rootDirectory),
 	}
 
 	return New(params)
@@ -167,7 +172,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 // bucketName
 func New(params DriverParameters) (*Driver, error) {
 	fdsobj := galaxy_fds_sdk_golang.NEWFDSClient(params.AccessKey,
-		params.SecretKey)
+		params.SecretKey, params.Region, params.EnableHttps, params.EnableCDN)
 	d := &driver{
 		fds:              fdsobj,
 		driverParameters: params,
@@ -192,46 +197,73 @@ func (d *driver) Name() string {
 func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 	reader, err := d.Reader(ctx, path, 0)
 	if err != nil {
-		return nil, err
+		return nil, parseError(path, err)
 	}
 	return ioutil.ReadAll(reader)
 }
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	_, err := d.fds.Put_Object(d.driverParameters.Bucket,
-	d.driverParameters.RootDirectory + path, contents, "")
+	fdsPath := d.fdsPath(path)
+	_, err := d.fds.Put_Object(d.driverParameters.Bucket, fdsPath, contents, "", nil)
 	return parseError(path, err)
 }
 
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-	data, err := d.fds.Get_Object(d.driverParameters.Bucket,
-		d.driverParameters.RootDirectory + path, offset, -1)
+	emptyReader := ioutil.NopCloser(bytes.NewReader(nil))
+	fdsPath := d.fdsPath(path)
+
+	reader, err := d.fds.Get_Object_Reader(d.driverParameters.Bucket,
+		fdsPath, offset, -1)
 
 	if err != nil {
+		if e, ok := err.(*Model.FDSError); ok && e.Code() == 416 {
+			return emptyReader, nil
+		}
 		return nil, parseError(path, err)
 	}
-	return bytes.NewReader(data), nil
+
+	return *reader, nil
 }
 
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
-	path = d.driverParameters + path
+	fdsPath := d.fdsPath(path)
 	if !append {
 		resp, err := d.fds.Init_MultiPart_Upload(d.driverParameters.Bucket,
-		path, "")
+			fdsPath, "")
 		if err != nil {
-			return nil, err
+			return nil, parseError(path, err)
 		}
-		return d.newWriter(path, resp, make([]*Model.UploadPartResult, 0))
+		return d.newWriter(ctx, resp, &Model.UploadPartList{}), nil
 	}
 
-	// TODO fds donot suppor list multipart upload result yet
+	list, err := d.fds.List_Multipart_Uploads(d.driverParameters.Bucket, fdsPath, "", 1)
+	if err != nil {
+		return nil, parseError(path, err)
+	}
 
-	return nil, errors.New("FDS do not support listing multipart uploads");
+	for _, multi := range list.Uploads {
+		if fdsPath != multi.ObjectName {
+			continue
+		}
+		uploadPartList, err := d.fds.List_Parts(d.driverParameters.Bucket, fdsPath, multi.UploadId)
+		if err != nil {
+			return nil, parseError(path, err)
+		}
+
+		initUploadResult := Model.InitMultipartUploadResult{
+			BucketName: d.driverParameters.Bucket,
+			ObjectName: fdsPath,
+			UploadId:   multi.UploadId,
+		}
+		return d.newWriter(ctx, &initUploadResult, uploadPartList), nil
+	}
+
+	return nil, storagedriver.PathNotFoundError{Path: path}
 }
 
 func parseTimeStr(timeStr string) (time.Time, error) {
@@ -244,19 +276,23 @@ func parseTimeStr(timeStr string) (time.Time, error) {
 		return t850, nil
 	}
 	tAnsci, err := time.Parse(time.ANSIC, timeStr)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		return tAnsci, nil
 	}
-	return tAnsci, nil
+	rfcTime, err := time.Parse(time.RFC1123, timeStr)
+	if err == nil {
+		return rfcTime, nil
+	}
+	return time.Now(), err
 }
 
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	path = d.driverParameters.RootDirectory + path
-	resp, err := d.fds.List_Object(d.driverParameters.Bucket, path, "/", 1)
+	fdsPath := d.fdsPath(path)
+	resp, err := d.fds.List_Object(d.driverParameters.Bucket, fdsPath, "", 1)
 	if err != nil {
-		return nil, err
+		return nil, parseError(path, err)
 	}
 
 	fi := storagedriver.FileInfoFields{
@@ -264,22 +300,22 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 	}
 
 	if len(resp.ObjectSummaries) == 1 {
-		if ((*resp.ObjectSummaries[0]).ObjectName != path) {
+		if (resp.ObjectSummaries[0]).ObjectName != fdsPath {
 			fi.IsDir = true
 		} else {
 			fi.IsDir = false
-			fi.Size = (*resp.ObjectSummaries[0]).Size
-			meta, err := d.fds.Get_Object_Meta(d.driverParameters.Bucket, path)
+			fi.Size = (resp.ObjectSummaries[0]).Size
+			meta, err := d.fds.Get_Object_Meta(d.driverParameters.Bucket, fdsPath)
 			if err != nil {
-				return nil, err
+				return nil, parseError(path, err)
 			}
-			timeStr, err := (*meta).GetLastModified();
+			timeStr, err := (*meta).GetLastModified()
 			if err != nil {
-				return nil, err
+				return nil, parseError(path, err)
 			}
 			fi.ModTime, err = parseTimeStr(timeStr)
 			if err != nil {
-				return nil, err
+				return nil, parseError(path, err)
 			}
 		}
 	} else if len(resp.CommonPrefixes) == 1 {
@@ -288,25 +324,30 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 
-	return nil, nil
+	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
 }
 
 // List returns a list of the objects that are direct descendants of the given path.
 func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
-	path := d.driverParameters.RootDirectory + opath
-	if path != "/" && path[len(path)-1] != '/' {
+	path := opath
+	if path != "/" && len(path) > 0 && path[len(path)-1] != '/' {
 		path = path + "/"
 	}
 
 	// This is to cover for the cases when the rootDirectory of the driver is either "" or "/".
-	// In those cases, there is no root prefix to replace and we must actually add a "/" to all
+	// In those cases, therDS do not support listing multipart uploade is no root prefix to replace and we must actually add a "/" to all
 	// results in order to keep them as valid paths as recognized by storagedriver.PathRegexp
 
+	prefix := ""
+	if d.fdsPath("") == "" {
+		prefix = "/"
+	}
+
 	resp, err := d.fds.List_Object(d.driverParameters.Bucket,
-		path, "/", 1000)
+		d.fdsPath(path), "/", galaxy_fds_sdk_golang.DEFAULT_LIST_MAX_KEYS)
 
 	if err != nil {
-		return nil, err
+		return nil, parseError(opath, err)
 	}
 
 	files := []string{}
@@ -314,24 +355,24 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 
 	for {
 		for _, key := range resp.ObjectSummaries {
-			files = append(files, *key.ObjectName)
+			files = append(files, strings.Replace(key.ObjectName, d.fdsPath(""), prefix, 1))
 		}
 
 		for _, commonPrefix := range resp.CommonPrefixes {
-			directories = append(directories, commonPrefix)
+			directories = append(directories, strings.Replace(commonPrefix[0:len(commonPrefix)-1], d.fdsPath(""), prefix, 1))
 		}
 
-		if *resp.Truncated {
-			resp, err = d.fds.List_Next_Bacth_Of_Objects(resp)
+		if resp.Truncated {
+			resp, err = d.fds.List_Next_Batch_Of_Objects(resp)
 			if err != nil {
-				return nil, err
+				return nil, parseError(opath, err)
 			}
 		} else {
 			break
 		}
 	}
 
-	if opath != "/" {
+	if path != "/" {
 		if len(files) == 0 && len(directories) == 0 {
 			// Treat empty response as missing directory, since we don't actually
 			// have directories in s3.
@@ -345,23 +386,27 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 // Move moves an object stored at sourcePath to destPath, removing the original
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
-	srcPath := d.driverParameters.RootDirectory + sourcePath
-	dstPath := d.driverParameters.RootDirectory + destPath
+	srcPath := d.fdsPath(sourcePath)
+	dstPath := d.fdsPath(destPath)
 	_, err := d.fds.Rename_Object(d.driverParameters.Bucket, srcPath, dstPath)
-	return err
+	return parseError(sourcePath, err)
 }
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
-func (d *driver) Delete(ctx context.Context, path string) error {
-	path = d.driverParameters.RootDirectory + path
-	_, err := d.fds.Delete_Object(d.driverParameters.RootDirectory, path)
-	return err
+func (d *driver) Delete(ctx context.Context, opath string) error {
+	path := d.fdsPath(opath)
+	l, err := d.fds.List_Object(d.driverParameters.Bucket, path, "", 1)
+	if err != nil || (len(l.ObjectSummaries) == 0 && len(l.CommonPrefixes) == 0) {
+		return storagedriver.PathNotFoundError{Path: opath}
+	}
+
+	return d.fds.Delete_Objects_With_Prefix(d.driverParameters.Bucket, path)
 }
 
 // URLFor returns a URL which may be used to retrieve the content stored at the given path.
 // May return an UnsupportedMethodErr in certain StorageDriver implementations.
 func (d *driver) URLFor(ctx context.Context, path string, options map[string]interface{}) (string, error) {
-	path = d.driverParameters.RootDirectory + path
+	fdsPath := d.fdsPath(path)
 	methodString := "GET"
 	method, ok := options["method"]
 	if ok {
@@ -380,27 +425,29 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 		}
 	}
 
-	return d.fds.Generate_Presigned_URI(d.driverParameters.Bucket, path, methodString, expiresAt)
+	return d.fds.Generate_Presigned_URI(d.driverParameters.Bucket,
+		fdsPath, methodString, expiresAt.UnixNano()/int64(time.Millisecond), map[string][]string{})
 }
 
 func (d *driver) fdsPath(path string) string {
-	return nil
+	return strings.TrimLeft(strings.TrimRight(d.driverParameters.RootDirectory, "/")+path, "/")
 }
 
 // fdsBucketKey returns the fds bucket key for the given storage driver path.
 func (d *Driver) fdsBucketKey(path string) string {
-	return nil
+	return ""
 }
 
 func parseError(path string, err error) error {
-	return nil
+	if err != nil {
+		if e, ok := err.(*Model.FDSError); ok && e.Code() == 404 {
+			return storagedriver.PathNotFoundError{Path: path}
+		}
+	}
+	return err
 }
 
 func (d *driver) getEncryptionMode() *string {
-	return nil
-}
-
-func (d *driver) getSSEKMSKeyID() *string {
 	return nil
 }
 
@@ -420,49 +467,86 @@ func (d *driver) getStorageClass() *string {
 // part is at least as large as the chunksize, so the multipart upload could be
 // cleanly resumed in the future. This is violated if Close is called after less
 // than a full chunk is written.
-type writer struct {
-	driver      *driver
-	initMultipartUploadResult *Model.InitMultipartUploadResult
-	partId      int
-	partUploadResultList *Model.UploadPartList
-	size        int64
-	closed      bool
-	committed   bool
-	cancelled   bool
-	buffer      []byte
+type uploadData struct {
+	partId  int
+	data    []byte
+	err     error
+	tryTime int
 }
 
-func (d *driver) newWriter(path, initMultipartUploadResult *Model.InitMultipartUploadResult, partUploadResult []*Model.UploadPartResult) storagedriver.FileWriter {
-	var sumSize int64
-	for _, p := range partUploadResult {
-		sumSize += p.PartSize
-	}
-	return &writer {
-		driver: d,
-		path: path,
-		initMultipartUploadResult: initMultipartUploadResult,
-		partUploadResult: partUploadResult,
-		size: sumSize,
+func newUploadData(partId int, data []byte) *uploadData {
+	return &uploadData{
+		partId:  partId,
+		data:    data,
+		err:     nil,
+		tryTime: 0,
 	}
 }
+
+type writer struct {
+	driver                    *driver
+	initMultipartUploadResult *Model.InitMultipartUploadResult
+	partUploadResultList      *Model.UploadPartList
+	size                      int64
+	closed                    bool
+	committed                 bool
+	cancelled                 bool
+	bufferList                []uploadData
+	lastUploadId              int
+	ctx                       context.Context
+}
+
+func (w *writer) appendByteArray(b []byte) {
+	l := len(w.bufferList)
+	if l == 0 || (l < maxBufferList && len(w.bufferList[l-1].data) >= minChunkSize) {
+		w.lastUploadId += 1
+		// use sum because i cannot find max(int, int) (int) in math package, either can i write one, it's too hard
+		a := make([]byte, len(b), cap(b) + minChunkSize)
+		copy(a, b)
+		w.bufferList = append(w.bufferList, *newUploadData(w.lastUploadId, a))
+	} else {
+		w.bufferList[l-1].data = append(w.bufferList[l-1].data, b...)
+	}
+}
+
+func (d *driver) newWriter(ctx context.Context, initMultipartUploadResult *Model.InitMultipartUploadResult,
+	uploadPartList *Model.UploadPartList) storagedriver.FileWriter {
+	var sumSize int64
+	for _, p := range uploadPartList.UploadPartResultList {
+		sumSize += p.PartSize
+	}
+
+	return &writer{
+		driver: d,
+		initMultipartUploadResult: initMultipartUploadResult,
+		partUploadResultList:      uploadPartList,
+		size:                      sumSize,
+		bufferList:                make([]uploadData, 0),
+		lastUploadId:              len(uploadPartList.UploadPartResultList),
+		ctx:                       ctx,
+	}
+}
+
+const maxBufferList = 10
 
 func (w *writer) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 
-	append(w.buffer, p)
-	if len(w.buffer) >= minChunkSize {
+	l := len(w.bufferList)
+	if l >= maxBufferList && len(w.bufferList[l-1].data) >= minChunkSize {
 		err := w.flushPart()
 		if err != nil {
-			return 0, nil
+			return 0, err
 		}
 	}
 
-	l := len(p)
-	w.size += l
+	w.appendByteArray(p)
+	pl := len(p)
+	w.size += int64(pl)
 
-	return l, nil
+	return pl, nil
 }
 
 func (w *writer) Size() int64 {
@@ -483,10 +567,9 @@ func (w *writer) Cancel() error {
 	} else if w.committed {
 		return fmt.Errorf("already committed")
 	}
-	w.Commit()
+
 	w.cancelled = true
-	_, err := w.driver.fds.Delete_Object(w.driver.driverParameters.Bucket, w.initMultipartUploadResult.ObjectName)
-	return err
+	return w.driver.fds.Abort_MultipartUpload(w.initMultipartUploadResult)
 }
 
 func (w *writer) Commit() error {
@@ -503,24 +586,44 @@ func (w *writer) Commit() error {
 	}
 	w.committed = true
 	_, err = w.driver.fds.Complete_Multipart_Upload(w.initMultipartUploadResult, w.partUploadResultList)
-	return err
+	return parseError(w.initMultipartUploadResult.ObjectName, err)
 }
 
 // flushPart flushes buffers to write a part to fds.
 // Only called by Write (with both buffers full) and Close/Commit (always)
+
+func (w *writer) uploadPart(p uploadData, c chan<- *uploadData) {
+	_, err := w.driver.fds.Upload_Part(w.initMultipartUploadResult, p.partId, p.data)
+	p.tryTime += 1
+	if err != nil {
+		p.err = err
+		c <- &p
+	} else {
+		c <- nil
+	}
+}
+
 func (w *writer) flushPart() error {
-	if len(w.buffer) == 0 {
-		w.buffer = nil
+	l := len(w.bufferList)
+	if l == 0 {
+		w.bufferList = nil
 		return nil
 	}
 
-	w.partId += 1
-	partResult, err := w.driver.fds.Upload_Part(w.initMultipartUploadResult.BucketName,
-		w.initMultipartUploadResult.ObjectName, w.partId, w.buffer)
-	if err != nil {
-		return err
+	c := make(chan *uploadData, l)
+	for _, d := range w.bufferList {
+		go w.uploadPart(d, c)
 	}
-	w.partUploadResultList.AddUploadPartResult(&partResult)
 
-	return nil
+	var errs error
+	w.bufferList = nil
+	for i := 0; i < l; i++ {
+		r := <-c
+		if r != nil {
+			errs = r.err
+			w.bufferList = append(w.bufferList, *r)
+		}
+	}
+
+	return errs
 }
