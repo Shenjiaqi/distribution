@@ -1,0 +1,3 @@
+[submodule "galaxy-fds-sdk-golang"]
+	path = galaxy-fds-sdk-golang
+	url = git://github.com/XiaoMi/galaxy-fds-sdk-golang.git
