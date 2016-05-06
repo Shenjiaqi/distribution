@@ -51,6 +51,7 @@ func init() {
 		"awsusor0",
 		"awssgp0",
 		"awsde0",
+		"c3",
 	} {
 		validRegions[region] = struct{}{}
 	}
